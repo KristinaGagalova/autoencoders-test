@@ -109,3 +109,86 @@ It is a **condition-level RNA-protein residual**, not an individual-sample disco
 With only eight treatment x timepoint cells per variety, use these residuals primarily for ranking and hypothesis generation unless additional independent conditions or experiments support formal inference.
 
 Replicate-specific temporal lag analysis is intentionally not implemented here because independent RNA and protein samples do not define a valid `RNA_rep_i(t) -> Protein_rep_i(t+1)` trajectory.
+
+
+# Reviewer-addressed unpaired RNA/protein analysis
+
+This bundle is designed to replace the current `rnaprot/unpaired.py` and to run through `rna_protein_unpaired_reviewer_addressed.ipynb`.
+
+## What changed
+
+### 1. Cognate ridge no longer depends on top-N RNA variance filtering
+
+Previously, `cognate_ridge` only used a cognate transcript if that transcript happened to be among `N_RNA` top-variable RNA features in the fold. Otherwise it silently fell back to the protein training mean.
+
+The new `_cognate_ridge_predict_unfiltered()` path:
+
+- uses the protein→gene mapping directly;
+- uses every mapped cognate gene present in the RNA matrix;
+- applies the same sample-wise RNA transform (e.g. CPM + log2);
+- learns cognate-gene scaling using outer-training condition means only;
+- reports per-protein fold coverage with `cognate_coverage_table()`.
+
+This makes `cognate_ridge` a real biological baseline rather than mostly a mean-model fallback.
+
+### 2. PCA and PLS dimensionality is nested inside outer CV
+
+`_loo_select_components()` chooses PCA/PLS component count using leave-one-condition-out validation among the outer-training conditions only. The held-out outer condition never selects the component count.
+
+The selected dimensions are stored in:
+
+```python
+oof["component_selection"]
+```
+
+### 3. Added controls for a shared low-rank/design response
+
+New models:
+
+- `pca1_ridge`: one RNA principal component only. If this is almost as good as the tuned PCA model, a single global response axis carries much of the predictive signal.
+- `design_resid_pca_ridge`: removes treatment/timepoint main effects from RNA and protein using outer-training conditions, then predicts protein residuals from RNA residuals.
+- `design_resid_pls`: analogous PLS control.
+
+These do not prove or disprove causality, but they distinguish broad experimental-design structure from cross-modal information beyond the main effects.
+
+### 4. Added per-condition R2 and leverage diagnostics
+
+`oof_condition_metrics()` reports per-held-condition RMSE and relative R2 across proteins.
+
+`condition_score_sensitivity()` recomputes the headline median per-protein R2 after removing one scored condition at a time. This is a metric-leverage diagnostic for conditions such as `T1|t3`.
+
+### 5. Strengthened permutation null
+
+`permutation_null()` now:
+
+- permutes complete protein condition labels, keeping protein replicates together;
+- accepts a `models` subset so linear nulls can be run cheaply;
+- accepts `reference_proteins`, allowing the null to be evaluated on exactly the same protein targets as the observed analysis;
+- returns a permutation-by-model table.
+
+`permutation_pvalue_table()` calculates one-sided empirical p-values for observed median R2 exceeding the null.
+
+A significant permutation test supports stronger-than-random RNA/protein **condition correspondence**. It does not establish causal RNA→protein regulation.
+
+## Recommended final run
+
+In the notebook configuration:
+
+```python
+TUNE_COMPONENTS = True
+RUN_PERMUTATIONS = True
+N_PERM = 200
+```
+
+For a more stable tail probability, use 500–1000 linear permutations if compute allows. The AE permutation test is separated because it is much more expensive:
+
+```python
+RUN_AE_PERMUTATIONS = True
+N_PERM_AE = 50  # exploratory; increase for final inference if feasible
+```
+
+## Files
+
+- `rnaprot/unpaired.py` — replacement module.
+- `rna_protein_unpaired_reviewer_addressed.ipynb` — notebook with diagnostics and interpretation guidance.
+- `reviewer_changes.patch` — unified diff against the current GitHub `rnaprot/unpaired.py` fetched on 2026-08-18.
