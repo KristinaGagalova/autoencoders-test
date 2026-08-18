@@ -182,10 +182,40 @@ def design_matrix_single(meta: pd.DataFrame, intercept=True):
     return np.hstack(parts).astype(np.float64), names
 
 
-def covariate_matrix_single(meta: pd.DataFrame) -> np.ndarray:
-    """Treatment + timepoint dummies only. 4 columns for a 2x4 design."""
-    X, _ = design_matrix_single(meta, intercept=False)
+def covariate_matrix_single(meta: pd.DataFrame, interactions=True) -> np.ndarray:
+    """
+    Treatment + timepoint dummies for a single variety.
+
+    With interactions=True (default) a 2x4 design gives 7 columns:
+    1 treatment + 3 timepoint + 3 treatment:timepoint. The docstring
+    previously claimed 4 columns, which described the no-interaction case --
+    and rnaprot.data.covariate_matrix really does build the 4-column version.
+    Passing two different covariate sets to the CV model and the full-data
+    model made their latent spaces non-comparable, so this must now be chosen
+    explicitly and threaded through run_cv via its covariate_fn argument.
+    """
+    if interactions:
+        X, _ = design_matrix_single(meta, intercept=False)
+    else:
+        parts = [pd.get_dummies(meta[t].astype(str), prefix=t,
+                                drop_first=True).astype(float).to_numpy()
+                 for t in ("treatment", "timepoint")]
+        X = np.hstack(parts)
     return X.astype(np.float32)
+
+
+def covariate_matrix_none(meta: pd.DataFrame):
+    """
+    No design covariates at all -- the model sees RNA only.
+
+    Use this for the discordance analysis. If treatment and timepoint are
+    inputs to the protein predictor, the residual D = observed - predicted is
+    "protein not explained by RNA *and* design", and then testing whether D
+    depends on treatment is asking a question the model was already handed the
+    answer to. An RNA-only predictor makes D mean what the analysis claims it
+    means.
+    """
+    return None
 
 
 # --------------------------------------------------------------------------
