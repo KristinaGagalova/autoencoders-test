@@ -221,21 +221,118 @@ def covariate_matrix_none(meta: pd.DataFrame):
 # --------------------------------------------------------------------------
 # Stage 2: cross-variety comparison of RESULTS
 # --------------------------------------------------------------------------
-def load_ortholog_map(path, col_a=0, col_b=1) -> pd.DataFrame:
+def rna_condition_means(data: OmicsData) -> pd.DataFrame:
     """
-    Two-column table linking variety A gene/protein IDs to variety B IDs.
+    Per-gene RNA profile, mean within each treatment x timepoint condition.
+
+    Used by load_ortholog_map() to break multi-way RBH ties: two loci can be
+    indistinguishable at the sequence level (identical protein, or not yet
+    diverged) and still be regulated differently, which condition-mean RNA
+    can see and sequence alignment cannot.
+    """
+    cond = data.meta["treatment"].astype(str) + "|" + data.meta["timepoint"].astype(str)
+    return data.rna.groupby(cond.to_numpy()).mean()  # conditions x genes
+
+
+def load_ortholog_map(path, col_a=0, col_b=1, rna_a=None, rna_b=None,
+                      min_shared_conditions=3) -> pd.DataFrame:
+    """
+    Table linking variety A gene/protein IDs to variety B IDs.
 
     Sources, in rough order of preference:
       - a published ortholog table for your species pair
       - OrthoFinder / OrthoMCL run on the two proteomes
-      - reciprocal best BLAST hits
+      - reciprocal best BLAST/DIAMOND hits (RBH)
       - shared locus IDs, if both assemblies were annotated against a common
         reference (in which case the "different genes" are really just
         presence/absence, and this map is trivial)
+
+    RBH in particular is frequently many-to-many, not 1:1: a gene family with
+    near-identical paralogs can have several equally-good hits, and sequence
+    identity alone cannot say which one is "the" ortholog -- there may be
+    nothing at the sequence level distinguishing them. The old version of
+    this function returned every (id_a, id_b) pair verbatim, which silently
+    pseudoreplicates a tied id_a's downstream statistics once per candidate
+    (a gene with 100 RBH hits contributed 100 near-identical rows to
+    compare_discordance's Fisher/Spearman tests). This version instead
+    collapses each id_a to exactly one id_b.
+
+    If `rna_a` / `rna_b` (condition-mean RNA matrices, conditions x genes --
+    see `rna_condition_means()`) are given, multi-way ties are broken with
+    expression: keep whichever id_b candidate has the most correlated RNA
+    profile across the conditions both varieties share. That is independent
+    information sequence alignment cannot see -- two loci can encode
+    identical proteins and still be regulated differently. Without rna_a/
+    rna_b, ties are resolved by keeping the first candidate and a warning is
+    printed; correctness then depends on the input already being close to
+    1:1.
+
+    Every row is tagged `resolution`:
+      unambiguous             -- exactly one candidate
+      expression_resolved_tie -- >1 candidate, broken by RNA correlation
+      unresolved_tie          -- >1 candidate, kept the first (no rna_a/
+                                 rna_b given, or no usable expression profile)
+    plus `n_candidates` and `best_corr` (NaN unless expression-resolved), so
+    a downstream comparison can be reported once on the full table and once
+    restricted to `unambiguous` only, as a sensitivity check on how much the
+    tie-breaking is actually doing.
+
+    Only ties on the id_a side are resolved to a single id_b. The same id_b
+    can still legitimately appear against more than one id_a afterward (e.g.
+    two id_a paralogs both best-matching the same id_b) -- that is not an
+    error, it is what asymmetric gene-family expansion between the two
+    assemblies looks like, so it is left as-is rather than force-fit into a
+    strict 1:1 map.
     """
     m = pd.read_csv(path)
-    return pd.DataFrame({"id_a": m.iloc[:, col_a].astype(str),
-                         "id_b": m.iloc[:, col_b].astype(str)}).dropna()
+    raw = pd.DataFrame({"id_a": m.iloc[:, col_a].astype(str),
+                        "id_b": m.iloc[:, col_b].astype(str)}).dropna()
+
+    shared_cond = None
+    if rna_a is not None and rna_b is not None:
+        shared_cond = sorted(set(rna_a.index) & set(rna_b.index))
+        if len(shared_cond) < min_shared_conditions:
+            print(f"[load_ortholog_map] only {len(shared_cond)} conditions shared "
+                 f"between rna_a/rna_b -- too few to correlate on, falling back "
+                 f"to first-candidate for ties")
+            shared_cond = None
+
+    rows = []
+    n_unresolved = 0
+    for id_a, grp in raw.groupby("id_a"):
+        cands = grp["id_b"].unique().tolist()
+        if len(cands) == 1:
+            rows.append((id_a, cands[0], 1, "unambiguous", np.nan))
+            continue
+
+        best_c, best_r = None, -np.inf
+        if shared_cond is not None and id_a in rna_a.columns:
+            a_prof = rna_a.loc[shared_cond, id_a].to_numpy(float)
+            if a_prof.std() > 0:
+                for c in cands:
+                    if c not in rna_b.columns:
+                        continue
+                    b_prof = rna_b.loc[shared_cond, c].to_numpy(float)
+                    if b_prof.std() == 0:
+                        continue
+                    r = np.corrcoef(a_prof, b_prof)[0, 1]
+                    if r > best_r:
+                        best_c, best_r = c, r
+
+        if best_c is not None:
+            rows.append((id_a, best_c, len(cands), "expression_resolved_tie", best_r))
+        else:
+            n_unresolved += 1
+            rows.append((id_a, cands[0], len(cands), "unresolved_tie", np.nan))
+
+    if n_unresolved:
+        print(f"[load_ortholog_map] {n_unresolved:,} multi-way ties kept their "
+             f"first candidate (no rna_a/rna_b given, or no usable expression "
+             f"profile) -- treat these rows as lower confidence, see the "
+             f"'resolution' column")
+
+    return pd.DataFrame(rows, columns=["id_a", "id_b", "n_candidates",
+                                       "resolution", "best_corr"])
 
 
 def compare_discordance(disc_a: pd.DataFrame, disc_b: pd.DataFrame,
